@@ -203,9 +203,15 @@ class Control4Entity(CoordinatorEntity[Any]):
         # removed in HA 2027.8.0. The controller device is created in
         # async_setup_entry before any platform loads, so look its id up here.
         # If it is ever missing, leave the link out rather than fail the entity.
-        controller = dr.async_get(self.hass).async_get_device(
-            identifiers={(DOMAIN, self._controller_unique_id)}
-        )
+        # async_get_device() is itself deprecated (identifiers are only unique
+        # per config entry); async_get_device_by_identifier() is scoped to one.
+        controller = None
+        platform = getattr(self, "platform", None)
+        config_entry = getattr(platform, "config_entry", None)
+        if config_entry is not None:
+            controller = dr.async_get(self.hass).async_get_device_by_identifier(
+                (DOMAIN, self._controller_unique_id), config_entry.entry_id
+            )
         info = DeviceInfo(
             identifiers={(DOMAIN, str(self._device_id))},
             manufacturer=self._device_manufacturer,
