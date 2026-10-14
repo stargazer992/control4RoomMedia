@@ -198,10 +198,20 @@ class Control4Entity(CoordinatorEntity[Any]):
     @property
     def device_info(self) -> DeviceInfo:
         """Return info of parent Control4 device of entity."""
-        return DeviceInfo(
+        # HA deprecated DeviceInfo/async_get_or_create "via_device" (identifier
+        # tuple) in favour of "via_device_id" (the device registry's own id),
+        # removed in HA 2027.8.0. The controller device is created in
+        # async_setup_entry before any platform loads, so look its id up here.
+        # If it is ever missing, leave the link out rather than fail the entity.
+        controller = dr.async_get(self.hass).async_get_device(
+            identifiers={(DOMAIN, self._controller_unique_id)}
+        )
+        info = DeviceInfo(
             identifiers={(DOMAIN, str(self._device_id))},
             manufacturer=self._device_manufacturer,
             model=self._device_model,
             name=self._device_name,
-            via_device=(DOMAIN, self._controller_unique_id),
         )
+        if controller is not None:
+            info["via_device_id"] = controller.id
+        return info
