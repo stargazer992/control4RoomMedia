@@ -44,7 +44,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.LIGHT, Platform.MEDIA_PLAYER, Platform.NUMBER]
+PLATFORMS = [Platform.LIGHT, Platform.MEDIA_PLAYER]
 
 API_RETRY_TMES = 5
 
