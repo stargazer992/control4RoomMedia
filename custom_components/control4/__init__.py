@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -48,6 +49,20 @@ PLATFORMS = [Platform.LIGHT, Platform.MEDIA_PLAYER]
 
 API_RETRY_TMES = 5
 
+# Seconds to wait between cloud API retries (multiplied by attempt number).
+API_RETRY_DELAY = 3
+
+# Transient failures seen in the wild (cloud timeout, empty/garbled reply).
+# These must trigger ConfigEntryNotReady so HA retries on its own, instead of
+# leaving the entry in a permanent "setup error" state.
+TRANSIENT_ERRORS = (
+    client_exceptions.ClientError,
+    asyncio.TimeoutError,
+    TimeoutError,
+    json.JSONDecodeError,
+    ValueError,
+)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Control4 from a config entry."""
@@ -59,8 +74,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     account = C4Account(config[CONF_USERNAME], config[CONF_PASSWORD], account_session)
     try:
         await account.getAccountBearerToken()
-    except client_exceptions.ClientError as exception:
-        _LOGGER.error("Error connecting to Control4 account API: %s", exception)
+    except TRANSIENT_ERRORS as exception:
+        _LOGGER.error(
+            "Error connecting to Control4 account API (will retry): %r", exception
+        )
         raise ConfigEntryNotReady from exception
     except BadCredentials as exception:
         _LOGGER.error(
@@ -83,10 +100,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 controller_unique_id
             )
             break
-        except client_exceptions.ClientError as exception:
-            _LOGGER.error("Error connecting to Control4 account API: %s", exception)
+        except TRANSIENT_ERRORS as exception:
+            _LOGGER.error(
+                "Error getting Control4 director token (attempt %s/%s): %r",
+                i + 1,
+                API_RETRY_TMES,
+                exception,
+            )
             if i == API_RETRY_TMES - 1:
                 raise ConfigEntryNotReady(exception) from exception
+            await asyncio.sleep(API_RETRY_DELAY * (i + 1))
 
     director_session = aiohttp_client.async_get_clientsession(hass, verify_ssl=False)
     director = C4Director(
@@ -94,19 +117,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     entry_data[CONF_DIRECTOR] = director
 
-    # Add retry for C4 Account API due to instability
+    # The OS version is only cosmetic (device registry sw_version). Never let
+    # a failure here block setup: retry a few times, then carry on without it.
+    entry_data[CONF_DIRECTOR_SW_VERSION] = None
     for i in range(API_RETRY_TMES):
         try:
-            # Add Control4 controller to device registry
             controller_href = (await account.getAccountControllers())["href"]
             entry_data[CONF_DIRECTOR_SW_VERSION] = await account.getControllerOSVersion(
                 controller_href
             )
             break
-        except client_exceptions.ClientError as exception:
-            _LOGGER.error("Error connecting to Control4 account API: %s", exception)
-            if i == API_RETRY_TMES - 1:
-                raise ConfigEntryNotReady(exception) from exception
+        except Exception as exception:  # noqa: BLE001 - non-fatal by design
+            _LOGGER.warning(
+                "Could not read Control4 OS version (attempt %s/%s): %r",
+                i + 1,
+                API_RETRY_TMES,
+                exception,
+            )
+            if i < API_RETRY_TMES - 1:
+                await asyncio.sleep(API_RETRY_DELAY * (i + 1))
 
     _, model, mac_address = controller_unique_id.split("_", 3)
     entry_data[CONF_DIRECTOR_MODEL] = model.upper()
@@ -123,11 +152,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Store all items found on controller for platforms to use
-    director_all_items = await director.getAllItemInfo()
-    director_all_items = json.loads(director_all_items)
-    entry_data[CONF_DIRECTOR_ALL_ITEMS] = director_all_items
+    try:
+        director_all_items = await director.getAllItemInfo()
+        director_all_items = json.loads(director_all_items)
+        entry_data[CONF_DIRECTOR_ALL_ITEMS] = director_all_items
 
-    entry_data[CONF_UI_CONFIGURATION] = json.loads(await director.getUiConfiguration())
+        entry_data[CONF_UI_CONFIGURATION] = json.loads(
+            await director.getUiConfiguration()
+        )
+    except TRANSIENT_ERRORS as exception:
+        _LOGGER.error(
+            "Error reading items from Control4 controller (will retry): %r",
+            exception,
+        )
+        raise ConfigEntryNotReady from exception
 
     # Load options from config entry
     entry_data[CONF_SCAN_INTERVAL] = entry.options.get(
